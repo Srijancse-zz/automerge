@@ -2,6 +2,8 @@ const { Map, List, fromJS } = require('immutable')
 const uuid = require('uuid/v4')
 const { rootObjectProxy } = require('./proxies')
 const OpSet = require('./op_set')
+const FreezeAPI = require('./freeze_api')
+const { Text } = require('./text')
 const transit = require('transit-immutable-js')
 
 function isObject(obj) {
@@ -10,7 +12,8 @@ function isObject(obj) {
 
 function makeOp(state, opProps) {
   const opSet = state.get('opSet'), actor = state.get('actorId'), op = fromJS(opProps)
-  return state.set('opSet', OpSet.addLocalOp(opSet, op, actor))
+  let [opSet2, diff] = OpSet.addLocalOp(opSet, op, actor)
+  return state.set('opSet', opSet2)
 }
 
 function insertAfter(state, listId, elemId) {
@@ -27,7 +30,10 @@ function createNestedObjects(state, value) {
   if (typeof value._objectId === 'string') return [state, value._objectId]
   const objectId = uuid()
 
-  if (Array.isArray(value)) {
+  if (value instanceof Text) {
+    state = makeOp(state, { action: 'makeText', obj: objectId })
+    if (value.length > 0) throw 'assigning non-empty text is not yet supported'
+  } else if (Array.isArray(value)) {
     state = makeOp(state, { action: 'makeList', obj: objectId })
     let elemId = '_head'
     for (let i = 0; i < value.length; i++) {
@@ -63,44 +69,31 @@ function setField(state, objectId, key, value) {
   }
 }
 
-function splice(state, listId, start, deletions, insertions) {
-  // Find start position
-  let i = 0, prev = '_head', next = OpSet.getNext(state.get('opSet'), listId, prev)
-  while (next && i < start) {
-    if (!OpSet.getFieldOps(state.get('opSet'), listId, next).isEmpty()) i += 1
-    prev = next
-    next = OpSet.getNext(state.get('opSet'), listId, prev)
-  }
-  if (i < start && insertions.length > 0) {
-    throw new RangeError('Cannot insert at index ' + start + ', which is past the end of the list')
+function splice(state, objectId, start, deletions, insertions) {
+  let elemIds = state.getIn(['opSet', 'byObject', objectId, '_elemIds'])
+  for (let i = 0; i < deletions; i++) {
+    let elemId = elemIds.keyOf(start)
+    if (elemId) {
+      state = makeOp(state, {action: 'del', obj: objectId, key: elemId})
+      elemIds = state.getIn(['opSet', 'byObject', objectId, '_elemIds'])
+    }
   }
 
   // Apply insertions
-  for (let ins of insertions) {
-    [state, prev] = insertAfter(state, listId, prev)
-    state = setField(state, listId, prev, ins)
+  let prev = (start === 0) ? '_head' : elemIds.keyOf(start - 1)
+  if (!prev && insertions.length > 0) {
+    throw new RangeError('Cannot insert at index ' + start + ', which is past the end of the list')
   }
-
-  // Apply deletions
-  while (next && i < start + deletions) {
-    if (!OpSet.getFieldOps(state.get('opSet'), listId, next).isEmpty()) {
-      state = makeOp(state, { action: 'del', obj: listId, key: next })
-      i += 1
-    }
-    next = OpSet.getNext(state.get('opSet'), listId, next)
+  for (let ins of insertions) {
+    [state, prev] = insertAfter(state, objectId, prev)
+    state = setField(state, objectId, prev, ins)
   }
   return state
 }
 
 function setListIndex(state, listId, index, value) {
-  let i = -1, elem = OpSet.getNext(state.get('opSet'), listId, '_head')
-  index = parseListIndex(index)
-  while (elem) {
-    if (!OpSet.getFieldOps(state.get('opSet'), listId, elem).isEmpty()) i += 1
-    if (i === index) break
-    elem = OpSet.getNext(state.get('opSet'), listId, elem)
-  }
-
+  const elemIds = state.getIn(['opSet', 'byObject', listId, '_elemIds'])
+  const elem = elemIds.keyOf(parseListIndex(index))
   if (elem) {
     return setField(state, listId, elem, value)
   } else {
@@ -109,7 +102,8 @@ function setListIndex(state, listId, index, value) {
 }
 
 function deleteField(state, objectId, key) {
-  if (state.getIn(['opSet', 'byObject', objectId, '_init', 'action']) === 'makeList') {
+  const objType = state.getIn(['opSet', 'byObject', objectId, '_init', 'action'])
+  if (objType === 'makeList' || objType === 'makeText') {
     return splice(state, objectId, parseListIndex(key), 1, [])
   }
   if (!state.hasIn(['opSet', 'byObject', objectId, key])) {
@@ -118,39 +112,19 @@ function deleteField(state, objectId, key) {
   return makeOp(state, { action: 'del', obj: objectId, key: key })
 }
 
-function rootObject(state, rootObj) {
-  Object.assign(Object.getPrototypeOf(rootObj), {_state: state, _actorId: state.get('actorId')})
-  Object.freeze(Object.getPrototypeOf(rootObj))
-  return rootObj
-}
-
-function applyChangeset(state, changeset) {
-  const [opSet, root] = OpSet.addChangeset(state.get('opSet'), changeset)
-  return rootObject(state.set('opSet', opSet), root)
-}
-
-function applyChangesets(store, changesets) {
-  return changesets.reduce(
-    (root, changeset) => applyChangeset(root._state, changeset),
-    store || init()
-  )
-}
-
-function makeChangeset(oldState, newState, message) {
-  const actor = oldState.get('actorId')
-  const seq = oldState.getIn(['opSet', 'clock', actor], 0) + 1
-  const deps = oldState.getIn(['opSet', 'deps']).remove(actor)
-  const changeset = fromJS({actor, seq, deps, message})
+function makeChange(root, newState, message) {
+  const actor = root._state.get('actorId')
+  const seq = root._state.getIn(['opSet', 'clock', actor], 0) + 1
+  const deps = root._state.getIn(['opSet', 'deps']).remove(actor)
+  const change = fromJS({actor, seq, deps, message})
     .set('ops', newState.getIn(['opSet', 'local']))
-  return applyChangeset(oldState, changeset)
+  return FreezeAPI.applyChanges(root, List.of(change), true)
 }
 
 ///// Automerge.* API
 
 function init(actorId) {
-  const [opSet, rootObj] = OpSet.materialize(OpSet.init())
-  const state = Map({actorId: actorId || uuid(), opSet})
-  return rootObject(state, rootObj)
+  return FreezeAPI.init(actorId || uuid())
 }
 
 function checkTarget(funcName, target, needMutable) {
@@ -159,9 +133,9 @@ function checkTarget(funcName, target, needMutable) {
     throw new TypeError('The first argument to Automerge.' + funcName +
                         ' must be the object to modify, but you passed ' + JSON.stringify(target))
   }
-  if (needMutable && (!target._changeset || !target._changeset.mutable)) {
+  if (needMutable && (!target._change || !target._change.mutable)) {
     throw new TypeError('Automerge.' + funcName + ' requires a writable object as first argument, ' +
-                        'but the one you passed is read-only. Please use Automerge.changeset() ' +
+                        'but the one you passed is read-only. Please use Automerge.change() ' +
                         'to get a writable version.')
   }
 }
@@ -175,22 +149,21 @@ function parseListIndex(key) {
   return key
 }
 
-function changeset(root, message, callback) {
-  checkTarget('changeset', root)
-  if (root._objectId !== '00000000-0000-0000-0000-000000000000') {
-    throw new TypeError('The first argument to Automerge.changeset must be the document root')
+function change(doc, message, callback) {
+  checkTarget('change', doc)
+  if (doc._objectId !== '00000000-0000-0000-0000-000000000000') {
+    throw new TypeError('The first argument to Automerge.change must be the document root')
   }
-  if (root._changeset && root._changeset.mutable) {
-    throw new TypeError('Calls to Automerge.changeset cannot be nested')
+  if (doc._change && doc._change.mutable) {
+    throw new TypeError('Calls to Automerge.change cannot be nested')
   }
   if (typeof message === 'function' && callback === undefined) {
     [message, callback] = [callback, message]
   }
 
-  const oldState = root._state
-  const context = {state: oldState, mutable: true, setField, splice, setListIndex, deleteField}
+  const context = {state: doc._state, mutable: true, setField, splice, setListIndex, deleteField}
   callback(rootObjectProxy(context))
-  return makeChangeset(oldState, context.state, message)
+  return makeChange(doc, context.state, message)
 }
 
 function assign(target, values) {
@@ -205,19 +178,16 @@ function assign(target, values) {
       state = setField(state, target._objectId, key, values[key])
     }
   }
-  target._changeset.state = state
+  target._change.state = state
 }
 
 function load(string, actorId) {
-  return applyChangesets(init(actorId), transit.fromJSON(string))
+  return FreezeAPI.applyChanges(FreezeAPI.init(actorId), transit.fromJSON(string), false)
 }
 
-function save(store) {
-  checkTarget('save', store)
-  const history = store._state
-    .getIn(['opSet', 'history'])
-    .map(state => state.get('changeset'))
-  return transit.toJSON(history)
+function save(doc) {
+  checkTarget('save', doc)
+  return transit.toJSON(doc._state.getIn(['opSet', 'history']))
 }
 
 function equals(val1, val2) {
@@ -231,31 +201,87 @@ function equals(val1, val2) {
   return true
 }
 
-function inspect(store) {
-  checkTarget('inspect', store)
-  return JSON.parse(JSON.stringify(store))
+function inspect(doc) {
+  checkTarget('inspect', doc)
+  return JSON.parse(JSON.stringify(doc))
 }
 
-function getHistory(store) {
-  checkTarget('inspect', store)
-  return store._state.getIn(['opSet', 'history']).toJS()
+function getHistory(doc) {
+  checkTarget('inspect', doc)
+  const history = doc._state.getIn(['opSet', 'history'])
+  return history.map((change, index) => {
+    return {
+      get change () {
+        return change.toJS()
+      },
+      get snapshot () {
+        const root = FreezeAPI.init(doc._state.get('actorId'))
+        return FreezeAPI.applyChanges(root, history.slice(0, index + 1), false)
+      }
+    }
+  }).toArray()
 }
-
-const DocSet = require('./doc_set')
-const Connection = require('./connection')
-DocSet.prototype.applyChangesets = applyChangesets
 
 function merge(local, remote) {
   checkTarget('merge', local)
   if (local._state.get('actorId') === remote._state.get('actorId')) {
-    throw new RangeError('Cannot merge a store with itself')
+    throw new RangeError('Cannot merge an actor with itself')
   }
 
   const clock = local._state.getIn(['opSet', 'clock'])
   const changes = OpSet.getMissingChanges(remote._state.get('opSet'), clock)
-  return applyChangesets(local, changes)
+  return FreezeAPI.applyChanges(local, changes, true)
+}
+
+// Returns true if all components of clock1 are less than or equal to those of clock2.
+// Returns false if there is at least one component in which clock1 is greater than clock2
+// (that is, either clock1 is overall greater than clock2, or the clocks are incomparable).
+function lessOrEqual(clock1, clock2) {
+  return clock1.keySeq().concat(clock2.keySeq()).reduce(
+    (result, key) => (result && clock1.get(key, 0) <= clock2.get(key, 0)),
+    true)
+}
+
+function diff(oldState, newState) {
+  checkTarget('diff', oldState)
+
+  const oldClock = oldState._state.getIn(['opSet', 'clock'])
+  const newClock = newState._state.getIn(['opSet', 'clock'])
+  if (!lessOrEqual(oldClock, newClock)) {
+    throw new RangeError('Cannot diff two states that have diverged')
+  }
+
+  let opSet = oldState._state.get('opSet').set('diff', List())
+  const changes = OpSet.getMissingChanges(newState._state.get('opSet'), oldClock)
+
+  let diffs = [], diff
+  for (let change of changes) {
+    [opSet, diff] = OpSet.addChange(opSet, change)
+    diffs.push(...diff)
+  }
+  return diffs
+}
+
+function getChanges(oldState, newState) {
+  checkTarget('getChanges', oldState)
+
+  const oldClock = oldState._state.getIn(['opSet', 'clock'])
+  const newClock = newState._state.getIn(['opSet', 'clock'])
+  if (!lessOrEqual(oldClock, newClock)) {
+    throw new RangeError('Cannot diff two states that have diverged')
+  }
+
+  return OpSet.getMissingChanges(newState._state.get('opSet'), oldClock).toJS()
+}
+
+function applyChanges(doc, changes) {
+  checkTarget('applyChanges', doc)
+  return FreezeAPI.applyChanges(doc, fromJS(changes), true)
 }
 
 module.exports = {
-  init, changeset, assign, load, save, equals, inspect, getHistory, DocSet, Connection, merge
+  init, change, merge, diff, assign, load, save, equals, inspect, getHistory,
+  getChanges, applyChanges, Text,
+  DocSet: require('./doc_set'),
+  Connection: require('./connection')
 }
